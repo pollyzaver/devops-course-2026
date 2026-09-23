@@ -1,1 +1,1 @@
-base version
+variant A2
