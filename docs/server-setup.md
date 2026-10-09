@@ -1,0 +1,94 @@
+# Конфигурация виртуальной машины devops-vm
+
+Гипервизор: VMware Fusion (macOS, Apple Silicon). Гостевая ОС: Ubuntu Server 26.04.1 LTS (ARM64).
+Адаптация методики: вместо VirtualBox с пробросом порта 127.0.0.1:2222 -> 22 используется прямое
+подключение по адресу сети Host-only («Private to my Mac»).
+
+## 1. Параметры машины
+- Имя ВМ: `devops-vm`, имя узла: `devops-vm` (FQDN `devops-vm.devops.local`)
+- Процессор: 2 ядра
+- Оперативная память: 4096 МБ
+- Диск: 25 ГБ (NVMe, динамический, LVM; корень `/` ~11 ГБ)
+- Установка: Ubuntu Server (не minimized), «Use an entire disk», OpenSSH server, без snap-пакетов
+- После установки: `sudo apt update && sudo apt upgrade -y`
+
+## 2. Сетевые интерфейсы
+| Интерфейс | Режим Fusion | Тип | Подсеть | Адрес ВМ | Назначение |
+|-----------|--------------|-----|---------|----------|------------|
+| enp2s0  | Share with my Mac | NAT (vmnet8)       | 172.16.30.0/24 | 172.16.30.132 (DHCP) | выход в интернет |
+| enp10s0 | Private to my Mac | Host-only (vmnet1) | 172.16.94.0/24 | 172.16.94.129 (DHCP) | доступ с хоста по SSH |
+
+Адрес хоста (Mac) в сети Host-only: 172.16.94.1. Подсети узнаются командой
+`grep SUBNET "/Library/Preferences/VMware Fusion/networking"` (VNET_1 — Host-only, VNET_8 — NAT).
+Адреса выдаются DHCP и могут меняться; при смене обновить `~/.ssh/config` и `/etc/hosts` на хосте.
+
+## 3. Правило проброса портов
+Проброс портов не используется (в Fusion для Host-only он не нужен). Подключение выполняется
+напрямую: хост 172.16.94.1 -> гость 172.16.94.129, порт 2222 (SSH). Запись на хосте в `/etc/hosts`:
+`172.16.94.129    devops.local`.
+
+## 4. Учётные записи
+| Имя | Группы | Способ аутентификации |
+|-----|--------|-----------------------|
+| student | student, adm, cdrom, sudo, dip, plugdev, users, lxd (создан установщиком) | пароль (только консоль; по SSH вход запрещён директивой AllowUsers) |
+| devops  | devops, sudo, users | по ключу ed25519 (`~/.ssh/devops_vm` на хосте) |
+
+Создание devops:
+```
+sudo adduser devops
+sudo usermod -aG sudo devops
+```
+Ключ (на хосте): `ssh-keygen -t ed25519 -C "devops-vm-key" -f ~/.ssh/devops_vm`
+(без парольной фразы), затем `ssh-copy-id -i ~/.ssh/devops_vm.pub devops@172.16.94.129`.
+Права: `~/.ssh` — 700, `authorized_keys` — 600. Клиентский `~/.ssh/config` на хосте:
+```
+Host devops
+    HostName 172.16.94.129
+    Port 2222
+    User devops
+    IdentityFile ~/.ssh/devops_vm
+    IdentitiesOnly yes
+```
+
+## 5. Служба SSH
+- Порт: 2222 (22 не используется)
+- Файл настроек: `/etc/ssh/sshd_config.d/99-hardening.conf` (основной `sshd_config` не изменялся,
+  резервная копия `/etc/ssh/sshd_config.backup`)
+- Директивы: `Port 2222`, `PermitRootLogin no`, `PasswordAuthentication no`,
+  `PubkeyAuthentication yes`, `PermitEmptyPasswords no`, `MaxAuthTries 3`, `LoginGraceTime 30`,
+  `AllowUsers devops`, `X11Forwarding no`, `ClientAliveInterval 300`, `ClientAliveCountMax 2`
+- Конфликтующий файл: в `/etc/ssh/sshd_config.d/50-cloud-init.conf` строка
+  `PasswordAuthentication yes` закомментирована:
+  `sudo sed -i 's/^PasswordAuthentication/#PasswordAuthentication/' /etc/ssh/sshd_config.d/50-cloud-init.conf`
+- Активация по сокету отключена, служба запускается напрямую:
+```
+sudo systemctl disable --now ssh.socket
+sudo systemctl enable --now ssh.service
+sudo systemctl restart ssh
+```
+- Проверка: `sudo sshd -t`, `sudo sshd -T`, `sudo ss -tlnp | grep sshd` (ожидается 0.0.0.0:2222)
+
+## 6. Правила межсетевого экрана (UFW)
+- Политики: `default deny incoming`, `default allow outgoing`, routed — disabled
+- Логирование: `sudo ufw logging medium` (журнал `/var/log/ufw.log`)
+- Правила (порядок: сначала разрешающие, потом `ufw enable`):
+```
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow 80/tcp comment 'HTTP'
+sudo ufw allow 443/tcp comment 'HTTPS'
+sudo ufw limit 2222/tcp comment 'SSH rate-limited'
+sudo ufw enable
+```
+- Итог: 80/tcp ALLOW, 443/tcp ALLOW, 2222/tcp LIMIT (для IPv4 и IPv6)
+- Имя узла: `sudo hostnamectl set-hostname devops-vm`, в `/etc/hosts` строка
+  `127.0.1.1 devops-vm.devops.local devops-vm`
+
+## 7. Снимки состояния
+| Наименование | Момент создания (9 октября 2026) | Состояние |
+|--------------|----------------------------------|-----------|
+| 01-clean-install   | 16:22 | чистая установка + `apt upgrade`, пользователь только student |
+| 02-keys-configured | 16:33 | создан devops, настроен вход по ключу |
+| 03-ssh-hardened    | 16:56 | усилена защита SSH (порт 2222, пароли отключены); файрвол ещё не включён |
+
+Файрвол (раздел 6) и имя узла настроены после снимка 03, отдельного снимка не имеют.
