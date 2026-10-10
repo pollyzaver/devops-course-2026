@@ -81,8 +81,12 @@ sudo ufw limit 2222/tcp comment 'SSH rate-limited'
 sudo ufw enable
 ```
 - Итог: 80/tcp ALLOW, 443/tcp ALLOW, 2222/tcp LIMIT (для IPv4 и IPv6)
-- Имя узла: `sudo hostnamectl set-hostname devops-vm`, в `/etc/hosts` строка
-  `127.0.1.1 devops-vm.devops.local devops-vm`
+- Имя узла и запись в `/etc/hosts` (строка `127.0.1.1 devops-vm` заменяется на FQDN):
+```
+sudo hostnamectl set-hostname devops-vm
+sudo sed -i 's/^127\.0\.1\.1.*/127.0.1.1 devops-vm.devops.local devops-vm/' /etc/hosts
+hostname -f      # ожидается devops-vm.devops.local
+```
 
 ## 7. Снимки состояния
 | Наименование | Момент создания (9 октября 2026) | Состояние |
