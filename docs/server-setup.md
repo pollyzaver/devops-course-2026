@@ -81,14 +81,88 @@ sudo ufw limit 2222/tcp comment 'SSH rate-limited'
 sudo ufw enable
 ```
 - Итог: 80/tcp ALLOW, 443/tcp ALLOW, 2222/tcp LIMIT (для IPv4 и IPv6)
-- Имя узла: `sudo hostnamectl set-hostname devops-vm`, в `/etc/hosts` строка
-  `127.0.1.1 devops-vm.devops.local devops-vm`
+- Имя узла и запись в `/etc/hosts` (строка `127.0.1.1 devops-vm` заменяется на FQDN):
+```
+sudo hostnamectl set-hostname devops-vm
+sudo sed -i 's/^127\.0\.1\.1.*/127.0.1.1 devops-vm.devops.local devops-vm/' /etc/hosts
+hostname -f      # ожидается devops-vm.devops.local
+```
 
 ## 7. Снимки состояния
-| Наименование | Момент создания (9 октября 2026) | Состояние |
-|--------------|----------------------------------|-----------|
-| 01-clean-install   | 16:22 | чистая установка + `apt upgrade`, пользователь только student |
-| 02-keys-configured | 16:33 | создан devops, настроен вход по ключу |
-| 03-ssh-hardened    | 16:56 | усилена защита SSH (порт 2222, пароли отключены); файрвол ещё не включён |
+| Наименование | Момент создания | Состояние |
+|--------------|-----------------|-----------|
+| 01-clean-install   | 9 октября 2026, 16:22  | чистая установка + `apt upgrade`, пользователь только student |
+| 02-keys-configured | 9 октября 2026, 16:33  | создан devops, настроен вход по ключу |
+| 03-ssh-hardened    | 9 октября 2026, 16:56  | усилена защита SSH (порт 2222, пароли отключены); файрвол ещё не включён |
+| 04-nginx-https     | 10 октября 2026, 15:32 | включены файрвол и имя узла (разделы 4–6, восстановлены с 01-clean-install), установлен Nginx, ресурс devops.local работает по HTTPS (раздел 8) |
 
-Файрвол (раздел 6) и имя узла настроены после снимка 03, отдельного снимка не имеют.
+Файрвол (раздел 6) и имя узла после снимка 03 настраивались без отдельного снимка; в 04 они уже
+включены. Снимок 04 создан от 01-clean-install (конфигурация воспроизведена по этому документу).
+
+## 8. Веб-сервер
+- Пакет: `nginx` (1.28.3 из репозитория Ubuntu), `sudo apt update && sudo apt install -y nginx`.
+  Главный процесс — от root, рабочие — от `www-data`. Слушает 80 и 443 (IPv4 и IPv6).
+- Конфигурация ресурса: `/etc/nginx/sites-available/devops-site`, включена ссылкой в
+  `/etc/nginx/sites-enabled/devops-site`; стандартный ресурс отключён (удалена ссылка
+  `/etc/nginx/sites-enabled/default`, файл в `sites-available` сохранён).
+- Каталог ресурса: `/var/www/devops-site`, владелец `devops:devops`, права каталогов 755, файлов 644
+  (модель «владелец пишет, веб-сервер читает»); файлов с записью для всех нет. Содержимое
+  доставляется из репозитория: `scripts/deploy.sh` (rsync `--delete --chmod=D755,F644`).
+- Сертификат: `/etc/ssl/certs/devops.crt`, права 644, владелец root (открытая часть).
+  Ключ: `/etc/ssl/private/devops.key`, права 600, владелец root (читает только главный процесс;
+  из `/etc/ssl/private` не копировать, в репозиторий не добавлять).
+- Формирование самоподписанного сертификата (срок 365 дней: 10.10.2026 – 10.10.2027, SAN
+  `DNS:devops.local`):
+```
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key \
+  -out /etc/ssl/certs/devops.crt \
+  -subj "/CN=devops.local" \
+  -addext "subjectAltName=DNS:devops.local"
+```
+- Содержимое `/etc/nginx/sites-available/devops-site` (HSTS не используется):
+```
+server {
+    listen 80;
+    listen [::]:80;
+    server_name devops.local;
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name devops.local;
+
+    ssl_certificate     /etc/ssl/certs/devops.crt;
+    ssl_certificate_key /etc/ssl/private/devops.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    root /var/www/devops-site;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    error_page 404 /404.html;
+
+    access_log /var/log/nginx/devops-site.access.log;
+    error_log /var/log/nginx/devops-site.error.log;
+}
+```
+- Порядок воспроизведения:
+```
+sudo mkdir -p /var/www/devops-site && sudo chown -R devops:devops /var/www/devops-site
+# создать сертификат (команда выше) и /etc/nginx/sites-available/devops-site (содержимое выше)
+sudo ln -s /etc/nginx/sites-available/devops-site /etc/nginx/sites-enabled/
+sudo rm /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+scripts/deploy.sh     # на хосте: доставка содержимого каталога site/
+```
+- Проверка на хосте: сертификат копируется по SSH (`scp devops:/etc/ssl/certs/devops.crt ~/devops.crt`),
+  затем `curl --cacert ~/devops.crt -I https://devops.local` (ожидается 200 OK);
+  `curl -I http://devops.local` — 301 на `https://devops.local/`.
+- Журналы: `/var/log/nginx/devops-site.access.log` и `devops-site.error.log` (блок 80 отдельного журнала
+  не имеет и пишет в `/var/log/nginx/access.log`).
