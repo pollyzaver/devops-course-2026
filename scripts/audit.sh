@@ -43,5 +43,14 @@ check "Конфигурация nginx корректна (nginx -t)"           "
 check "Сертификат действует ещё не менее ${CERT_MIN_DAYS} дн." "0"  "$CERT_OK"
 check "Нет файлов ресурса с записью для всех; ключ 600"   "0 600"  "$WRITABLE $KEY_MODE"
 
+echo "[5] Контейнеризация"
+DB_HEALTH="$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null)"
+EXPOSED="$(ss -tln | awk '{print $4}' | grep -E ':(5000|5432)$' | grep -vc '^127\.0\.0\.1:')"
+ENV_MODE="$(stat -c '%a' ~/app/.env 2>/dev/null)"
+check "Служба docker активна"                            "active"  "$(systemctl is-active docker)"
+check "Контейнер СУБД в состоянии healthy"               "healthy" "$DB_HEALTH"
+check "Порты 5000 и 5432 слушаются только на 127.0.0.1"  "0"       "$EXPOSED"
+check "Права файла ~/app/.env равны 600"                 "600"     "$ENV_MODE"
+
 echo "Пройдено: $PASS, не пройдено: $FAIL"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1
