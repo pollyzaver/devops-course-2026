@@ -95,6 +95,7 @@ hostname -f      # ожидается devops-vm.devops.local
 | 02-keys-configured | 9 октября 2026, 16:33  | создан devops, настроен вход по ключу |
 | 03-ssh-hardened    | 9 октября 2026, 16:56  | усилена защита SSH (порт 2222, пароли отключены); файрвол ещё не включён |
 | 04-nginx-https     | 10 октября 2026, 15:32 | включены файрвол и имя узла (разделы 4–6, восстановлены с 01-clean-install), установлен Nginx, ресурс devops.local работает по HTTPS (раздел 8) |
+| 05-docker-compose  | 21 октября 2026, 13:09 | установлен Docker Engine, проект app (Flask + PostgreSQL) работает в Docker Compose; публикация через Nginx настроена после снимка (раздел 9) |
 
 Файрвол (раздел 6) и имя узла после снимка 03 настраивались без отдельного снимка; в 04 они уже
 включены. Снимок 04 создан от 01-clean-install (конфигурация воспроизведена по этому документу).
@@ -166,3 +167,31 @@ scripts/deploy.sh     # на хосте: доставка содержимого
   `curl -I http://devops.local` — 301 на `https://devops.local/`.
 - Журналы: `/var/log/nginx/devops-site.access.log` и `devops-site.error.log` (блок 80 отдельного журнала
   не имеет и пишет в `/var/log/nginx/access.log`).
+
+## 9. Контейнеризация
+- Docker Engine: пакет `docker-ce` 29.9.2 из официального репозитория `download.docker.com`
+  (источник `/etc/apt/sources.list.d/docker.sources`, ключ `/etc/apt/keyrings/docker.asc`);
+  плагин Compose v5.6.1 (`docker-compose-plugin`), containerd 2.4.2. Пакет `docker.io` из репозитория
+  Ubuntu не используется.
+- Группа `docker`: только учётная запись `devops` (имеет право sudo). Участник группы фактически
+  получает права root, поэтому другие учётные записи в группу не добавляются.
+- Проект: `/home/devops/app` (Dockerfile, docker-compose.yml, app.py, requirements.txt,
+  .env.example). Содержимое доставляется с хоста: `rsync -avz --delete --exclude=.env app/ devops:app/`
+  (исключение `.env` обязательно, иначе `--delete` удалит секреты).
+- Файл `.env`: `/home/devops/app/.env`, владелец `devops`, права 600, пароль СУБД сформирован на
+  сервере (`openssl rand -hex 16`), в репозиторий и на хост не копируется.
+- Сервисы: `app` (образ `devops-app:1.0`, процесс от пользователя `app`, не root) и `db`
+  (`postgres:16-alpine`, проверка готовности `pg_isready`, `app` стартует после состояния healthy).
+- Публикуемые порты: `127.0.0.1:5000 -> 5000` (приложение, только для Nginx на этой же машине).
+  Порт СУБД 5432 не публикуется; приложение находит СУБД по имени `db` в сети проекта.
+- Сеть: `app_backend` (bridge). Том с данными: `app_db_data` (`/var/lib/postgresql/data`);
+  `docker compose down` том сохраняет, `docker compose down -v` удаляет вместе с базой.
+- Обратный прокси-сервер: в HTTPS-блок `/etc/nginx/sites-available/devops-site` добавлено
+  расположение `location /app/` с `proxy_pass http://127.0.0.1:5000/;` и заголовками Host, X-Real-IP,
+  X-Forwarded-For, X-Forwarded-Proto; статический ресурс сохранён.
+- Порядок воспроизведения: установить Docker по инструкции (источник: docs.docker.com/engine/install/ubuntu),
+  `sudo usermod -aG docker devops`, доставить `app/`, создать `.env` (см. выше), затем
+  `cd ~/app && docker compose up -d --build`, добавить `location /app/` и выполнить
+  `sudo nginx -t && sudo systemctl reload nginx`.
+- Проверка: `docker compose ps` (db healthy), `curl --cacert ~/devops.crt https://devops.local/app/`,
+  `sudo ss -tlnp | grep -E ':(5000|5432)\b'` (только `127.0.0.1:5000`).
