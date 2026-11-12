@@ -195,3 +195,42 @@ scripts/deploy.sh     # на хосте: доставка содержимого
   `sudo nginx -t && sudo systemctl reload nginx`.
 - Проверка: `docker compose ps` (db healthy), `curl --cacert ~/devops.crt https://devops.local/app/`,
   `sudo ss -tlnp | grep -E ':(5000|5432)\b'` (только `127.0.0.1:5000`).
+
+## 10. Ansible
+Настройка VM и развёртывание приложения описаны декларативно в каталоге `ansible/` репозитория
+(ветка `feature/ansible`); состояние VM воспроизводится запуском плейбука, а не ручными командами.
+
+- Управляющий узел: MacBook (macOS, Apple Silicon), Ansible (ansible-core 2.21.6, пакет `ansible` из
+  Homebrew; коллекции `ansible.posix`, `community.docker`, `community.general` входят в пакет),
+  `sshpass` для первичного запуска по паролю. Управляемый узел: `devops-vm` (Ubuntu Server 26.04 ARM64,
+  VMware Fusion), после отката к снимку `01-clean-install` доступна по Host-only адресу `172.16.94.129`,
+  SSH на порту 22. Агент на VM не нужен: модули выполняются по SSH, на VM требуются Python и
+  `python3-requests` (для модулей `community.docker`).
+- Inventory: `inventory/bootstrap.ini` (первичный запуск от `student` по паролю, `--ask-pass
+  --ask-become-pass`) и `inventory/prod.ini` (последующие запуски от `devops` по ключу
+  `~/.ssh/devops_vm`, без ввода пароля). Пароли и закрытый ключ в репозиторий не входят.
+- `ansible.cfg`: `host_key_checking = True`, `force_handlers = True` (уведомлённые handlers SSH и Nginx
+  выполняются даже при отказе более поздней задачи), `pipelining = True`.
+- Роли (`site.yml`, порядок важен):
+  - `base`: проверка платформы, базовые пакеты, официальный репозиторий Docker (deb822), Docker Engine,
+    служба Docker;
+  - `ssh`: пользователь `devops`, ключ, sudo без пароля (`/etc/sudoers.d/devops`, проверка `visudo`),
+    hardening SSH в `/etc/ssh/sshd_config.d/00-ansible-hardening.conf` (проверка `sshd -t`, парольный вход
+    отключён), UFW (deny incoming, открыты 22 и 80);
+  - `nginx`: пакет, шаблон reverse proxy `devops-ci-app.conf.j2`, отключение сайта по умолчанию,
+    handlers (`nginx -t`, затем reload);
+  - `app`: загрузка образа, контейнер, проверка `/health`.
+- Приложение: образ `ghcr.io/pollyzaver/devops-ci-app`, версия задаётся переменной `app_tag` в
+  `group_vars/all.yml` полным SHA коммита (сейчас `efadcc5168d27557448680121ed105ce24934784`, тег `latest`
+  не используется). Образ мультиархитектурный (linux/amd64 и linux/arm64), потому что VM работает на ARM64.
+  Контейнер `devops-ci-app` публикуется только на `127.0.0.1:5000`, наружу он доступен через Nginx
+  на порту 80. Проверка здоровья: `GET /health` возвращает `{"status":"ok"}`.
+- Первичный запуск: `cd ansible && ansible-playbook -i inventory/bootstrap.ini site.yml --ask-pass
+  --ask-become-pass`. Повторные запуски: `ansible-playbook site.yml` (ожидается `changed=0`).
+- Аудит без изменений: `ansible-playbook verify.yml` (проверяет эффективную конфигурацию `sshd -T`,
+  состояние контейнера и ответ `/health`; повторный запуск даёт `changed=0`).
+- Смена версии: изменить `app_tag` на полный SHA нового зелёного коммита и выполнить `site.yml`. При
+  недоступном теге задача загрузки образа завершается ошибкой до изменения контейнера, прежний контейнер
+  продолжает работать.
+- Проверка: `curl --fail http://172.16.94.129/health`, `sudo ss -tlnp | grep -E ':(22|80|5000)\b'`,
+  `docker ps`, `sudo ufw status verbose`.
